@@ -33,7 +33,9 @@
     </div>
     <div class="ui">
       <div class="card">
-        <div class="row"><label>Intensidad caída</label><input id="intensity" type="range" min="0" max="60" step="1" value="28"></div>
+        <div class="row"><label>Intensidad caída</label><input id="intensity" type="range" min="0" max="140" step="1" value="60"></div>
+        <div class="row"><label>Potencia (no lineal)</label><input id="power" type="range" min="1" max="3" step="0.05" value="1.6"></div>
+        <div class="row"><label>Feather (px)</label><input id="feather" type="range" min="0" max="40" step="1" value="12"></div>
         <div class="row"><label>Lado</label>
           <select id="side">
             <option value="left">Izquierdo (cara caída izquierda)</option>
@@ -69,6 +71,8 @@
   const g = dbg.getContext('2d');
 
   const intensityEl = document.getElementById('intensity');
+  const powerEl = document.getElementById('power');
+  const featherEl = document.getElementById('feather');
   const sideEl = document.getElementById('side');
   const smoothEl = document.getElementById('smooth');
   const toggleDbg = document.getElementById('toggleDbg');
@@ -92,9 +96,19 @@
   // Preferencias de región: subconjuntos de landmarks (aprox) para mejilla y comisura
   // Nota: índices basados en MediaPipe FaceMesh (468 pts). Puedes afinarlos con debug ON.
   // Lado izquierdo (vista de la persona en pantalla): comisura 61, zona mejilla 50,101,118, 205, 206, 207; mandíbula 172, 234 aprox.
-  const REGION_LEFT  = [61, 50, 101, 118, 48, 205, 206, 207, 187, 147, 123, 116, 117, 118, 172, 136, 150, 149, 176, 234];
-  // Lado derecho: comisura 291 y equivalentes espejo
-  const REGION_RIGHT = [291, 280, 330, 349, 268, 425, 426, 427, 411, 377, 352, 347, 346, 345, 397, 365, 379, 378, 400, 454];
+  const REGION_LEFT  = [
+    61, 40, 37, 0, 267, // entorno boca/centro
+    50, 101, 118, 48, 95, 88, 178, // mejilla interior
+    205, 206, 207, 187, 147, 123, 116, 117, // mejilla media
+    172, 136, 150, 149, 176, 234 // línea mandibular
+  ];
+  // Lado derecho
+  const REGION_RIGHT = [
+    291, 270, 267, 0, 37,
+    280, 330, 349, 268, 326, 323, 411,
+    425, 426, 427, 411, 377, 352, 347, 346,
+    397, 365, 379, 378, 400, 454
+  ];
 
   // Suavizado exponencial simple
   function EMA(prev, next, alpha){ return prev==null? next : prev*alpha + next*(1-alpha); }
@@ -234,8 +248,30 @@
     sctx.drawImage(res.image, 0,0, W,H);
     sctx.restore();
 
-    // 2) Dibujar warpeado en destino
-    warpRegion(sctx, ctx, srcRegion, withDeform);
+    // 2) Dibujar warpeado en destino (offscreen para feather)
+    const dstC = document.createElement('canvas'); dstC.width=W; dstC.height=H; const dctx = dstC.getContext('2d');
+    warpRegion(sctx, dctx, srcRegion, withDeform);
+
+    // 3) Feather / máscara suave
+    const mask = document.createElement('canvas'); mask.width=W; mask.height=H; const mctx = mask.getContext('2d');
+    mctx.fillStyle = '#fff'; mctx.beginPath(); polygon(mctx, srcRegion); mctx.fill();
+    const feather = parseFloat(featherEl.value);
+
+    // Aplicar máscara con blur
+    ctx.save();
+    if (feather > 0) ctx.filter = `blur(${feather}px)`;
+    ctx.globalCompositeOperation = 'destination-over';
+    // Preparar canal alpha usando mask
+    const tmp = document.createElement('canvas'); tmp.width=W; tmp.height=H; const tctx = tmp.getContext('2d');
+    tctx.drawImage(mask,0,0);
+    if (feather > 0) tctx.filter = `blur(${feather}px)`;
+    // Dibujar warpeado
+    ctx.restore();
+    // Componer resultado final
+    ctx.save();
+    ctx.globalCompositeOperation = 'source-over';
+    ctx.drawImage(dstC,0,0);
+    ctx.restore();
 
     // Opcional: contorno
     if(showDebug){ drawDebug(smoothedLandmarks); g.strokeStyle='rgba(248,113,113,.8)'; g.lineWidth=2; g.beginPath(); polygon(g, srcRegion); g.stroke(); }
