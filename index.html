@@ -9,9 +9,10 @@
     *{box-sizing:border-box}
     body{margin:0; font-family:ui-sans-serif,-apple-system,Segoe UI,Roboto; background:radial-gradient(900px 600px at 70% -10%,#13213f 0%,#0b1020 60%),var(--bg); color:var(--text)}
     .wrap{display:grid; grid-template-columns:1fr 360px; gap:16px; padding:16px; min-height:100vh}
-    .stage{position:relative; background:#020617; border:1px solid rgba(255,255,255,.06); border-radius:12px; overflow:hidden}
+    .stage{position:relative; background:#020617; border:1px solid rgba(255,255,255,.06); border-radius:12px; overflow:hidden; width:100%;}
+    /* La altura de .stage se ajusta dinámicamente para mantener el aspect ratio del video (ver onResize()) */
     #video{display:none}
-    canvas{position:absolute; inset:0; width:100%; height:100%}
+    canvas{position:absolute; left:0; top:0; width:100%; height:100%;}
     .ui{display:flex; flex-direction:column; gap:12px}
     .card{background:rgba(2,6,23,.6); border:1px solid rgba(255,255,255,.06); border-radius:12px; padding:12px}
     .row{display:flex; align-items:center; gap:10px}
@@ -22,34 +23,35 @@
     small{color:var(--muted)}
     .legend{font-size:12px; color:#cbd5e1; line-height:1.5}
     .pill{display:inline-flex; gap:8px; align-items:center; padding:6px 10px; border-radius:999px; background:rgba(2,6,23,.7); border:1px solid rgba(255,255,255,.06); font-size:12px}
+    @media (max-width: 980px){ .wrap{grid-template-columns:1fr; } }
   </style>
 </head>
 <body>
   <div class="wrap">
-    <div class="stage">
+    <div class="stage" id="stage">
       <video id="video" playsinline></video>
       <canvas id="output"></canvas>
       <canvas id="debug"></canvas>
     </div>
     <div class="ui">
       <div class="card">
-        <div class="row"><label>Intensidad caída</label><input id="intensity" type="range" min="0" max="140" step="1" value="140"></div>
-        <div class="row"><label>Potencia (no lineal)</label><input id="power" type="range" min="1" max="3" step="0.05" value="3"></div>
-        <div class="row"><label>Feather (px)</label><input id="feather" type="range" min="0" max="40" step="1" value="20"></div>
+        <div class="row"><label>Intensidad caída</label><input id="intensity" type="range" min="0" max="180" step="1" value="180"></div>
+        <div class="row"><label>Potencia (no lineal)</label><input id="power" type="range" min="1" max="3.5" step="0.05" value="3.2"></div>
+        <div class="row"><label>Feather (px)</label><input id="feather" type="range" min="0" max="60" step="1" value="24"></div>
         <div class="row"><label>Lado</label>
           <select id="side">
             <option value="left">Izquierdo (cara caída izquierda)</option>
             <option value="right">Derecho (cara caída derecha)</option>
           </select>
         </div>
-        <div class="row"><label>Suavizado</label><input id="smooth" type="range" min="0" max="0.9" step="0.01" value="0.3"></div>
+        <div class="row"><label>Suavizado</label><input id="smooth" type="range" min="0" max="0.9" step="0.01" value="0.25"></div>
         <div class="row"><label>Mostrar puntos</label><button id="toggleDbg" class="btn ghost">Alternar (N)</button></div>
         <div class="row"><label>&nbsp;</label><button id="snap" class="btn">Guardar snapshot</button></div>
-        <small>Tip: usa luz frontal y encuadra el rostro. Teclas: <b>N</b> toggles debug, <b>S</b> snapshot.</small>
+        <small>Tip: luz frontal y rostro centrado. Teclas: <b>N</b> debug, <b>S</b> snapshot.</small>
       </div>
       <div class="card legend">
-        <div class="pill">Objetivo: simular <b>asimetría facial</b> (descenso de comisura labial y mejilla) compatible con <b>signo de EVC</b>. No es diagnóstico.</div>
-        <p><b>Cómo funciona:</b> MediaPipe FaceMesh detecta 468 puntos. Tomamos una región (mejilla + comisura labial) y aplicamos un <i>warp</i> pieza‑por‑pieza (triángulos) desplazando la comisura y los puntos de la mejilla hacia abajo para simular la caída.</p>
+        <div class="pill">Simulación educativa de asimetría facial compatible con signo de EVC. No diagnóstico.</div>
+        <p>Más agresivo: caída comisura/mejilla + leve ptosis en ceja/párpado ipsilateral y <i>lift</i> sutil contralateral para aumentar contraste.</p>
       </div>
     </div>
   </div>
@@ -59,7 +61,13 @@
   <script src="https://cdn.jsdelivr.net/npm/@mediapipe/camera_utils@0.3/camera_utils.js"></script>
   <script src="https://cdn.jsdelivr.net/npm/delaunator@5.0.0/delaunator.min.js"></script>
   <script>
-  // Controles
+  // ===== DOM & State =====
+  const stage = document.getElementById('stage');
+  const video = document.getElementById('video');
+  const canvas = document.getElementById('output');
+  const dbg = document.getElementById('debug');
+  const ctx = canvas.getContext('2d');
+  const g = dbg.getContext('2d');
   const intensityEl = document.getElementById('intensity');
   const powerEl = document.getElementById('power');
   const featherEl = document.getElementById('feather');
@@ -67,81 +75,171 @@
   const smoothEl = document.getElementById('smooth');
   const toggleDbg = document.getElementById('toggleDbg');
   const snapBtn = document.getElementById('snap');
-  const video = document.getElementById('video');
-  const canvas = document.getElementById('output');
-  const dbg = document.getElementById('debug');
-  const ctx = canvas.getContext('2d');
-  const g = dbg.getContext('2d');
-
   let showDebug = false;
+
   toggleDbg.addEventListener('click', ()=> showDebug = !showDebug);
   document.addEventListener('keydown', (e)=>{
     if(e.key.toLowerCase()==='n') showDebug = !showDebug;
     if(e.key.toLowerCase()==='s') snapshot();
   });
   snapBtn.addEventListener('click', snapshot);
+  function snapshot(){ const a=document.createElement('a'); a.href=canvas.toDataURL('image/png'); a.download='evc-demo.png'; a.click(); }
 
-  function snapshot(){
-    const a = document.createElement('a');
-    a.href = canvas.toDataURL('image/png');
-    a.download = 'evc-demo.png';
-    a.click();
-  }
-
-  // regiones ampliadas
+  // ===== Regiones =====
+  // Mejilla/mandíbula expandida
   const REGION_LEFT  = [61,40,37,0,267,50,101,118,48,95,88,178,205,206,207,187,147,123,116,117,172,136,150,149,176,234];
   const REGION_RIGHT = [291,270,267,0,37,280,330,349,268,326,323,411,425,426,427,411,377,352,347,346,397,365,379,378,400,454];
+  // Ceja/párpado (aprox) para ptosis leve
+  const BROW_LEFT = [70,63,105,66,107,55,65,52,53,46];
+  const BROW_RIGHT = [300,293,334,296,336,285,295,282,283,276];
 
   function EMA(prev,next,alpha){return prev==null? next : prev*alpha+next*(1-alpha)}
   let smoothedLandmarks=null;
 
   function drawDebug(landmarks){
     g.clearRect(0,0,dbg.width,dbg.height);
-    g.strokeStyle='rgba(56,189,248,.8)';
-    g.fillStyle='rgba(226,232,240,.95)';
-    g.font='10px ui-sans-serif';
-    for(let i=0;i<landmarks.length;i++){const p=landmarks[i];g.beginPath();g.arc(p.x,p.y,2,0,Math.PI*2);g.stroke();g.fillText(i,p.x+3,p.y+3);}
+    g.strokeStyle='rgba(56,189,248,.8)'; g.fillStyle='rgba(226,232,240,.95)'; g.font='10px ui-sans-serif';
+    for(let i=0;i<landmarks.length;i++){ const p=landmarks[i]; g.beginPath(); g.arc(p.x,p.y,2,0,Math.PI*2); g.stroke(); g.fillText(i,p.x+3,p.y+3); }
   }
 
   function warpRegion(srcCtx,dstCtx,srcPts,dstPts){
-    const coords=[];srcPts.forEach(p=>{coords.push(p.x,p.y)});
-    const dela=Delaunator.from(coords);const tris=dela.triangles;
-    for(let i=0;i<tris.length;i+=3){const i0=tris[i],i1=tris[i+1],i2=tris[i+2];const s0=srcPts[i0],s1=srcPts[i1],s2=srcPts[i2];const d0=dstPts[i0],d1=dstPts[i1],d2=dstPts[i2];drawWarpedTriangle(srcCtx,dstCtx,s0,s1,s2,d0,d1,d2);}
+    const coords=[]; srcPts.forEach(p=>{coords.push(p.x,p.y)});
+    const dela=Delaunator.from(coords); const tris=dela.triangles;
+    for(let i=0;i<tris.length;i+=3){ const i0=tris[i], i1=tris[i+1], i2=tris[i+2];
+      const s0=srcPts[i0], s1=srcPts[i1], s2=srcPts[i2];
+      const d0=dstPts[i0], d1=dstPts[i1], d2=dstPts[i2];
+      drawWarpedTriangle(srcCtx,dstCtx,s0,s1,s2,d0,d1,d2);
+    }
   }
   function drawWarpedTriangle(srcCtx,dstCtx,s0,s1,s2,d0,d1,d2){
-    const minSx=Math.floor(Math.min(s0.x,s1.x,s2.x));const minSy=Math.floor(Math.min(s0.y,s1.y,s2.y));const maxSx=Math.ceil(Math.max(s0.x,s1.x,s2.x));const maxSy=Math.ceil(Math.max(s0.y,s1.y,s2.y));const w=Math.max(1,maxSx-minSx),h=Math.max(1,maxSy-minSy);const imgData=srcCtx.getImageData(minSx,minSy,w,h);
-    dstCtx.save();dstCtx.beginPath();dstCtx.moveTo(d0.x,d0.y);dstCtx.lineTo(d1.x,d1.y);dstCtx.lineTo(d2.x,d2.y);dstCtx.closePath();dstCtx.clip();const t=computeAffine(s0,s1,s2,d0,d1,d2);dstCtx.setTransform(t.a,t.b,t.c,t.d,t.e,t.f);dstCtx.drawImage(imageDataToCanvas(imgData),0,0,w,h,minSx,minSy,w,h);dstCtx.restore();dstCtx.setTransform(1,0,0,1,0,0);}
-  function computeAffine(s0,s1,s2,d0,d1,d2){const denom=(s0.x*(s1.y-s2.y)+s1.x*(s2.y-s0.y)+s2.x*(s0.y-s1.y));if(Math.abs(denom)<1e-6)return{a:1,b:0,c:0,d:1,e:0,f:0};const a=(d0.x*(s1.y-s2.y)+d1.x*(s2.y-s0.y)+d2.x*(s0.y-s1.y))/denom;const b=(d0.y*(s1.y-s2.y)+d1.y*(s2.y-s0.y)+d2.y*(s0.y-s1.y))/denom;const c=(d0.x*(s2.x-s1.x)+d1.x*(s0.x-s2.x)+d2.x*(s1.x-s0.x))/denom;const d=(d0.y*(s2.x-s1.x)+d1.y*(s0.x-s2.x)+d2.y*(s1.x-s0.x))/denom;const e=(d0.x*(s1.x*s2.y-s2.x*s1.y)+d1.x*(s2.x*s0.y-s0.x*s2.y)+d2.x*(s0.x*s1.y-s1.x*s0.y))/denom;const f=(d0.y*(s1.x*s2.y-s2.x*s1.y)+d1.y*(s2.x*s0.y-s0.x*s2.y)+d2.y*(s0.x*s1.y-s1.x*s0.y))/denom;return{a,b,c,d,e,f}}
-  function imageDataToCanvas(img){const c=document.createElement('canvas');c.width=img.width;c.height=img.height;c.getContext('2d').putImageData(img,0,0);return c;}
+    const minSx=Math.floor(Math.min(s0.x,s1.x,s2.x)); const minSy=Math.floor(Math.min(s0.y,s1.y,s2.y));
+    const maxSx=Math.ceil(Math.max(s0.x,s1.x,s2.x)); const maxSy=Math.ceil(Math.max(s0.y,s1.y,s2.y));
+    const w=Math.max(1,maxSx-minSx), h=Math.max(1,maxSy-minSy);
+    const imgData=srcCtx.getImageData(minSx,minSy,w,h);
+    dstCtx.save(); dstCtx.beginPath(); dstCtx.moveTo(d0.x,d0.y); dstCtx.lineTo(d1.x,d1.y); dstCtx.lineTo(d2.x,d2.y); dstCtx.closePath(); dstCtx.clip();
+    const t=computeAffine(s0,s1,s2,d0,d1,d2);
+    dstCtx.setTransform(t.a,t.b,t.c,t.d,t.e,t.f);
+    dstCtx.drawImage(imageDataToCanvas(imgData),0,0,w,h,minSx,minSy,w,h);
+    dstCtx.restore(); dstCtx.setTransform(1,0,0,1,0,0);
+  }
+  function computeAffine(s0,s1,s2,d0,d1,d2){
+    const denom=(s0.x*(s1.y-s2.y)+s1.x*(s2.y-s0.y)+s2.x*(s0.y-s1.y)); if(Math.abs(denom)<1e-6) return {a:1,b:0,c:0,d:1,e:0,f:0};
+    const a=(d0.x*(s1.y-s2.y)+d1.x*(s2.y-s0.y)+d2.x*(s0.y-s1.y))/denom;
+    const b=(d0.y*(s1.y-s2.y)+d1.y*(s2.y-s0.y)+d2.y*(s0.y-s1.y))/denom;
+    const c=(d0.x*(s2.x-s1.x)+d1.x*(s0.x-s2.x)+d2.x*(s1.x-s0.x))/denom;
+    const d=(d0.y*(s2.x-s1.x)+d1.y*(s0.x-s2.x)+d2.y*(s1.x-s0.x))/denom;
+    const e=(d0.x*(s1.x*s2.y-s2.x*s1.y)+d1.x*(s2.x*s0.y-s0.x*s2.y)+d2.x*(s0.x*s1.y-s1.x*s0.y))/denom;
+    const f=(d0.y*(s1.x*s2.y-s2.x*s1.y)+d1.y*(s2.x*s0.y-s0.x*s2.y)+d2.y*(s0.x*s1.y-s1.x*s0.y))/denom;
+    return {a,b,c,d,e,f};
+  }
+  function imageDataToCanvas(img){ const c=document.createElement('canvas'); c.width=img.width; c.height=img.height; c.getContext('2d').putImageData(img,0,0); return c; }
 
+  // ===== MediaPipe =====
   const faceMesh=new FaceMesh({locateFile:(file)=>`https://cdn.jsdelivr.net/npm/@mediapipe/face_mesh@0.4/${file}`});
   faceMesh.setOptions({maxNumFaces:1,refineLandmarks:true,minDetectionConfidence:0.7,minTrackingConfidence:0.6});
   faceMesh.onResults(onResults);
 
   async function startCam(){
     const stream=await navigator.mediaDevices.getUserMedia({video:{facingMode:'user',width:{ideal:1280},height:{ideal:720}},audio:false});
-    video.srcObject=stream;await video.play();canvas.width=dbg.width=video.videoWidth;canvas.height=dbg.height=video.videoHeight;new Camera(video,{onFrame:async()=>{await faceMesh.send({image:video});},width:video.videoWidth,height:video.videoHeight}).start();}
+    video.srcObject=stream; await video.play();
+    canvas.width=dbg.width=video.videoWidth; canvas.height=dbg.height=video.videoHeight;
+    onResize(); window.addEventListener('resize', onResize);
+    new Camera(video,{onFrame:async()=>{await faceMesh.send({image:video});},width:video.videoWidth,height:video.videoHeight}).start();
+  }
 
-  function polygon(ctx,pts){ctx.moveTo(pts[0].x,pts[0].y);for(let i=1;i<pts.length;i++)ctx.lineTo(pts[i].x,pts[i].y);ctx.closePath();}
+  function onResize(){
+    const vw = stage.clientWidth;
+    const aspect = video.videoHeight / video.videoWidth; // alto/anch
+    stage.style.height = (vw * aspect) + 'px'; // mantiene proporción -> evita cara estirada
+  }
+
+  function polygon(ctx,pts){ ctx.moveTo(pts[0].x,pts[0].y); for(let i=1;i<pts.length;i++) ctx.lineTo(pts[i].x,pts[i].y); ctx.closePath(); }
 
   function onResults(res){
     ctx.clearRect(0,0,canvas.width,canvas.height);
     ctx.drawImage(res.image,0,0,canvas.width,canvas.height);
-    if(!res.multiFaceLandmarks||!res.multiFaceLandmarks.length)return;
+    if(!res.multiFaceLandmarks||!res.multiFaceLandmarks.length) return;
     const lm=res.multiFaceLandmarks[0];
-    const W=canvas.width,H=canvas.height;
+    const W=canvas.width, H=canvas.height;
     const pts=lm.map(p=>({x:p.x*W,y:p.y*H,z:p.z}));
+
+    // Suavizado
     const alpha=parseFloat(smoothEl.value);
-    if(!smoothedLandmarks)smoothedLandmarks=pts;else smoothedLandmarks=smoothedLandmarks.map((p,i)=>({x:EMA(p.x,pts[i].x,alpha),y:EMA(p.y,pts[i].y,alpha),z:EMA(p.z,pts[i].z,alpha)}));
-    const side=sideEl.value;const ids=side==='left'?REGION_LEFT:REGION_RIGHT;const srcRegion=ids.map(i=>({...smoothedLandmarks[i]}));
-    const anchorIdx=(side==='left')?61:291;const anchor=smoothedLandmarks[anchorIdx];const drop=parseFloat(intensityEl.value);const power=parseFloat(powerEl.value);const sigma=140;
-    const withDeform=srcRegion.map((p,idx)=>{const i=ids[idx];const dx=p.x-anchor.x;const dy=p.y-anchor.y;const d=Math.hypot(dx,dy);let w=Math.exp(-(d*d)/(2*sigma*sigma));const boostJaw=[172,234,397,454].includes(i)?1.3:1.0;const boostCheek=[50,101,118,280,330,349,205,206,207,425,426,427].includes(i)?1.2:1.0;w=Math.min(1,Math.pow(w*boostJaw*boostCheek,power));let y=p.y+drop*w;let x=p.x+(side==='left'?drop*0.18*w:-drop*0.18*w);return{x,y};});
-    const srcC=document.createElement('canvas');srcC.width=W;srcC.height=H;const sctx=srcC.getContext('2d');sctx.save();sctx.beginPath();polygon(sctx,srcRegion);sctx.clip();sctx.drawImage(res.image,0,0,W,H);sctx.restore();
-    const dstC=document.createElement('canvas');dstC.width=W;dstC.height=H;const dctx=dstC.getContext('2d');warpRegion(sctx,dctx,srcRegion,withDeform);
-    const mask=document.createElement('canvas');mask.width=W;mask.height=H;const mctx=mask.getContext('2d');mctx.fillStyle='#fff';mctx.beginPath();polygon(mctx,srcRegion);mctx.fill();const feather=parseFloat(featherEl.value);ctx.save();if(feather>0)ctx.filter=`blur(${feather}px)`;ctx.globalCompositeOperation='destination-over';const tmp=document.createElement('canvas');tmp.width=W;tmp.height=H;const tctx=tmp.getContext('2d');tctx.drawImage(mask,0,0);if(feather>0)tctx.filter=`blur(${feather}px)`;ctx.restore();ctx.save();ctx.globalCompositeOperation='source-over';ctx.drawImage(dstC,0,0);ctx.restore();
-    if(showDebug){drawDebug(smoothedLandmarks);g.strokeStyle='rgba(248,113,113,.8)';g.lineWidth=2;g.beginPath();polygon(g,srcRegion);g.stroke();}
+    if(!smoothedLandmarks) smoothedLandmarks=pts; else smoothedLandmarks=smoothedLandmarks.map((p,i)=>({x:EMA(p.x,pts[i].x,alpha),y:EMA(p.y,pts[i].y,alpha),z:EMA(p.z,pts[i].z,alpha)}));
+
+    // Medidas de escala facial para normalizar la agresividad
+    const jawL=smoothedLandmarks[234], jawR=smoothedLandmarks[454];
+    const faceWidth=Math.hypot(jawR.x-jawL.x, jawR.y-jawL.y); // ~180-260 px típico
+    const scale = faceWidth/200; // normalizador
+
+    const side=sideEl.value; const ids=side==='left'?REGION_LEFT:REGION_RIGHT; const browIds=side==='left'?BROW_LEFT:BROW_RIGHT;
+    const srcRegion=ids.map(i=>({...smoothedLandmarks[i]}));
+    const srcBrow=browIds.map(i=>({...smoothedLandmarks[i]}));
+
+    const anchorIdx=(side==='left')?61:291; const oppIdx=(side==='left')?291:61;
+    const anchor=smoothedLandmarks[anchorIdx]; const opp=smoothedLandmarks[oppIdx];
+
+    const dropBase=parseFloat(intensityEl.value)*scale; // adaptado al tamaño de rostro
+    const power=parseFloat(powerEl.value);
+    const sigma=140*scale; // radio de influencia relativo a cara
+
+    const withDeform=srcRegion.map((p,idx)=>{
+      const i=ids[idx];
+      const dx=p.x-anchor.x, dy=p.y-anchor.y; const d=Math.hypot(dx,dy);
+      let w=Math.exp(-(d*d)/(2*sigma*sigma));
+      const boostJaw=[172,234,397,454].includes(i)?1.5:1.0;
+      const boostCheek=[50,101,118,280,330,349,205,206,207,425,426,427].includes(i)?1.35:1.0;
+      w=Math.min(1,Math.pow(w*boostJaw*boostCheek,power));
+      let y=p.y + dropBase * w; // caída principal
+      let x=p.x + (side==='left'? dropBase*0.28*w : -dropBase*0.28*w); // más skew lateral
+      return {x,y};
+    });
+
+    // Ptosis leve en ceja/párpado ipsilateral
+    const browDeform=srcBrow.map(p=>{
+      const dx=p.x-anchor.x, dy=p.y-anchor.y; const d=Math.hypot(dx,dy);
+      let w=Math.exp(-(d*d)/(2*(100*scale)**2)); w=Math.min(1,Math.pow(w, power*0.8));
+      return {x:p.x, y:p.y + dropBase*0.35*w};
+    });
+
+    // Pequeño lift contralateral en comisura opuesta para aumentar contraste visual
+    const lift = 0.22*dropBase;
+    const withLiftCorner = (ctx2)=>{
+      ctx2.save();
+      ctx2.fillStyle='rgba(0,0,0,0)'; // no necesitamos clip aquí; solo pintaremos región boca opuesta con leve traslación
+      // Trasladar una pequeña vecindad alrededor de oppIdx (simple aproximación visual)
+      const rad = 30*scale;
+      ctx2.globalCompositeOperation='source-over';
+      ctx2.drawImage(canvas, opp.x-rad, opp.y-rad- lift, rad*2, rad*2, opp.x-rad, opp.y-rad, rad*2, rad*2);
+      ctx2.restore();
+    };
+
+    // 1) Capa fuente recortada para región mejilla
+    const srcC=document.createElement('canvas'); srcC.width=W; srcC.height=H; const sctx=srcC.getContext('2d');
+    sctx.save(); sctx.beginPath(); polygon(sctx,srcRegion); sctx.clip(); sctx.drawImage(video,0,0,W,H); sctx.restore();
+
+    // 2) Warpear mejilla
+    const dstC=document.createElement('canvas'); dstC.width=W; dstC.height=H; const dctx=dstC.getContext('2d');
+    warpRegion(sctx,dctx,srcRegion,withDeform);
+
+    // 3) Warpear ceja/párpado (ptosis leve)
+    const srcB=document.createElement('canvas'); srcB.width=W; srcB.height=H; const sbctx=srcB.getContext('2d');
+    sbctx.save(); sbctx.beginPath(); polygon(sbctx,srcBrow); sbctx.clip(); sbctx.drawImage(video,0,0,W,H); sbctx.restore();
+    const dstB=document.createElement('canvas'); dstB.width=W; dstB.height=H; const dbctx=dstB.getContext('2d');
+    warpRegion(sbctx, dbctx, srcBrow, browDeform);
+
+    // 4) Composición con feather
+    const feather=parseFloat(featherEl.value);
+    ctx.save(); if(feather>0) ctx.filter=`blur(${feather}px)`; ctx.drawImage(dstC,0,0); ctx.restore();
+    ctx.save(); if(feather>0) ctx.filter=`blur(${Math.max(4,feather-6)}px)`; ctx.drawImage(dstB,0,0); ctx.restore();
+
+    // 5) Lift contralateral (muy sutil)
+    withLiftCorner(ctx);
+
+    if(showDebug){ drawDebug(smoothedLandmarks); g.strokeStyle='rgba(248,113,113,.8)'; g.lineWidth=2; g.beginPath(); polygon(g,srcRegion); g.stroke(); }
   }
-  startCam().catch(err=>{alert('No se pudo iniciar la cámara: '+err.message);});
+
+  startCam().catch(err=>{ alert('No se pudo iniciar la cámara: '+err.message); });
   </script>
 </body>
 </html>
