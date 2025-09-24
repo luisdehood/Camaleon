@@ -1,0 +1,249 @@
+<!doctype html>
+<html lang="es">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Face Deformation (EVC demo) • MediaPipe + Canvas</title>
+  <style>
+    :root { --bg:#0b1020; --panel:#0f172a; --text:#e5e7eb; --muted:#94a3b8; --accent:#38bdf8; }
+    *{box-sizing:border-box}
+    body{margin:0; font-family:ui-sans-serif,-apple-system,Segoe UI,Roboto; background:radial-gradient(900px 600px at 70% -10%,#13213f 0%,#0b1020 60%),var(--bg); color:var(--text)}
+    .wrap{display:grid; grid-template-columns:1fr 360px; gap:16px; padding:16px; min-height:100vh}
+    .stage{position:relative; background:#020617; border:1px solid rgba(255,255,255,.06); border-radius:12px; overflow:hidden}
+    #video{display:none}
+    canvas{position:absolute; inset:0; width:100%; height:100%}
+    .ui{display:flex; flex-direction:column; gap:12px}
+    .card{background:rgba(2,6,23,.6); border:1px solid rgba(255,255,255,.06); border-radius:12px; padding:12px}
+    .row{display:flex; align-items:center; gap:10px}
+    .row>label{min-width:120px; font-size:13px; color:var(--muted)}
+    input[type="range"]{width:100%}
+    .btn{appearance:none; border:0; border-radius:12px; padding:10px 12px; background:linear-gradient(180deg,#22d3ee,#06b6d4); color:#001018; font-weight:700; cursor:pointer}
+    .ghost{background:rgba(15,23,42,.7); color:#e2e8f0; border:1px solid #23314f}
+    small{color:var(--muted)}
+    .legend{font-size:12px; color:#cbd5e1; line-height:1.5}
+    .pill{display:inline-flex; gap:8px; align-items:center; padding:6px 10px; border-radius:999px; background:rgba(2,6,23,.7); border:1px solid rgba(255,255,255,.06); font-size:12px}
+  </style>
+</head>
+<body>
+  <div class="wrap">
+    <div class="stage">
+      <video id="video" playsinline></video>
+      <canvas id="output"></canvas>
+      <canvas id="debug"></canvas>
+    </div>
+    <div class="ui">
+      <div class="card">
+        <div class="row"><label>Intensidad caída</label><input id="intensity" type="range" min="0" max="60" step="1" value="28"></div>
+        <div class="row"><label>Lado</label>
+          <select id="side">
+            <option value="left">Izquierdo (cara caída izquierda)</option>
+            <option value="right">Derecho (cara caída derecha)</option>
+          </select>
+        </div>
+        <div class="row"><label>Suavizado</label><input id="smooth" type="range" min="0" max="0.9" step="0.01" value="0.5"></div>
+        <div class="row"><label>Mostrar puntos</label><button id="toggleDbg" class="btn ghost">Alternar (N)</button></div>
+        <div class="row"><label>&nbsp;</label><button id="snap" class="btn">Guardar snapshot</button></div>
+        <small>Tip: usa luz frontal y encuadra el rostro. Teclas: <b>N</b> toggles debug, <b>S</b> snapshot.</small>
+      </div>
+      <div class="card legend">
+        <div class="pill">Objetivo: simular <b>asimetría facial</b> (descenso de comisura labial y mejilla) compatible con <b>signo de EVC</b>. No es diagnóstico.</div>
+        <p><b>Cómo funciona:</b> MediaPipe FaceMesh detecta 468 puntos. Tomamos una región (mejilla + comisura labial) y aplicamos un <i>warp</i> pieza‑por‑pieza (triángulos) desplazando la comisura y los puntos de la mejilla hacia abajo para simular la caída.</p>
+        <p>Si necesitas coincidir con tu Spark AR, activa <b>Mostrar puntos</b>, identifica los índices que usabas y ajústalos abajo en el código (array <code>REGION_LEFT</code>/<code>REGION_RIGHT</code>).</p>
+      </div>
+    </div>
+  </div>
+
+  <!-- MediaPipe FaceMesh CDN -->
+  <script src="https://cdn.jsdelivr.net/npm/@mediapipe/face_mesh@0.4/face_mesh.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/@mediapipe/drawing_utils@0.3/drawing_utils.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/@mediapipe/camera_utils@0.3/camera_utils.js"></script>
+  <!-- Tiny triangulation helper (Delaunator) -->
+  <script src="https://cdn.jsdelivr.net/npm/delaunator@5.0.0/delaunator.min.js"></script>
+
+  <script>
+  // ====== Setup ======
+  const video = document.getElementById('video');
+  const canvas = document.getElementById('output');
+  const dbg = document.getElementById('debug');
+  const ctx = canvas.getContext('2d');
+  const g = dbg.getContext('2d');
+
+  const intensityEl = document.getElementById('intensity');
+  const sideEl = document.getElementById('side');
+  const smoothEl = document.getElementById('smooth');
+  const toggleDbg = document.getElementById('toggleDbg');
+  const snapBtn = document.getElementById('snap');
+
+  let showDebug = false;
+  toggleDbg.addEventListener('click', ()=> showDebug = !showDebug);
+  document.addEventListener('keydown', (e)=>{
+    if(e.key.toLowerCase()==='n') showDebug = !showDebug;
+    if(e.key.toLowerCase()==='s') snapshot();
+  });
+  snapBtn.addEventListener('click', snapshot);
+
+  function snapshot(){
+    const a = document.createElement('a');
+    a.href = canvas.toDataURL('image/png');
+    a.download = 'evc-demo.png';
+    a.click();
+  }
+
+  // Preferencias de región: subconjuntos de landmarks (aprox) para mejilla y comisura
+  // Nota: índices basados en MediaPipe FaceMesh (468 pts). Puedes afinarlos con debug ON.
+  // Lado izquierdo (vista de la persona en pantalla): comisura 61, zona mejilla 50,101,118, 205, 206, 207; mandíbula 172, 234 aprox.
+  const REGION_LEFT  = [61, 50, 101, 118, 48, 205, 206, 207, 187, 147, 123, 116, 117, 118, 172, 136, 150, 149, 176, 234];
+  // Lado derecho: comisura 291 y equivalentes espejo
+  const REGION_RIGHT = [291, 280, 330, 349, 268, 425, 426, 427, 411, 377, 352, 347, 346, 345, 397, 365, 379, 378, 400, 454];
+
+  // Suavizado exponencial simple
+  function EMA(prev, next, alpha){ return prev==null? next : prev*alpha + next*(1-alpha); }
+  let smoothedLandmarks = null;
+
+  // Dibuja índices debug
+  function drawDebug(landmarks){
+    g.clearRect(0,0,dbg.width,dbg.height);
+    g.strokeStyle = 'rgba(56,189,248,.8)';
+    g.fillStyle = 'rgba(226,232,240,.95)';
+    g.font = '10px ui-sans-serif';
+    for(let i=0;i<landmarks.length;i++){
+      const p = landmarks[i];
+      g.beginPath(); g.arc(p.x, p.y, 2, 0, Math.PI*2); g.stroke();
+      g.fillText(i, p.x+3, p.y+3);
+    }
+  }
+
+  // Utilidades de warping por triángulos (pieza‑por‑pieza)
+  function warpRegion(srcCtx, dstCtx, srcPts, dstPts){
+    // Triangulación
+    const coords = [];
+    srcPts.forEach(p=>{ coords.push(p.x, p.y); });
+    const dela = Delaunator.from(coords);
+    const tris = dela.triangles; // indices sobre srcPts
+
+    for(let i=0;i<tris.length;i+=3){
+      const i0 = tris[i], i1 = tris[i+1], i2 = tris[i+2];
+      const s0 = srcPts[i0], s1 = srcPts[i1], s2 = srcPts[i2];
+      const d0 = dstPts[i0], d1 = dstPts[i1], d2 = dstPts[i2];
+      drawWarpedTriangle(srcCtx, dstCtx, s0,s1,s2, d0,d1,d2);
+    }
+  }
+
+  function drawWarpedTriangle(srcCtx, dstCtx, s0,s1,s2, d0,d1,d2){
+    // Bounding boxes
+    const minSx = Math.floor(Math.min(s0.x,s1.x,s2.x));
+    const minSy = Math.floor(Math.min(s0.y,s1.y,s2.y));
+    const maxSx = Math.ceil(Math.max(s0.x,s1.x,s2.x));
+    const maxSy = Math.ceil(Math.max(s0.y,s1.y,s2.y));
+    const w = Math.max(1, maxSx-minSx), h = Math.max(1, maxSy-minSy);
+    const imgData = srcCtx.getImageData(minSx, minSy, w, h);
+
+    // Reset transform and clip dest triangle
+    dstCtx.save();
+    dstCtx.beginPath();
+    dstCtx.moveTo(d0.x, d0.y); dstCtx.lineTo(d1.x, d1.y); dstCtx.lineTo(d2.x, d2.y); dstCtx.closePath();
+    dstCtx.clip();
+
+    // Compute affine transform from source tri to dest tri
+    const t = computeAffine(s0,s1,s2, d0,d1,d2);
+    dstCtx.setTransform(t.a, t.b, t.c, t.d, t.e, t.f);
+    // Draw the subimage at the correct offset
+    dstCtx.drawImage(imageDataToCanvas(imgData), 0, 0, w, h, minSx, minSy, w, h);
+    dstCtx.restore();
+    dstCtx.setTransform(1,0,0,1,0,0);
+  }
+
+  function computeAffine(s0,s1,s2, d0,d1,d2){
+    // Solve for matrix T such that T*[sx,sy,1] = [dx,dy]
+    // Using standard formula for affine from 3 points
+    const denom = (s0.x*(s1.y - s2.y) + s1.x*(s2.y - s0.y) + s2.x*(s0.y - s1.y));
+    if (Math.abs(denom) < 1e-6) return {a:1,b:0,c:0,d:1,e:0,f:0};
+    const a = (d0.x*(s1.y - s2.y) + d1.x*(s2.y - s0.y) + d2.x*(s0.y - s1.y)) / denom;
+    const b = (d0.y*(s1.y - s2.y) + d1.y*(s2.y - s0.y) + d2.y*(s0.y - s1.y)) / denom;
+    const c = (d0.x*(s2.x - s1.x) + d1.x*(s0.x - s2.x) + d2.x*(s1.x - s0.x)) / denom;
+    const d = (d0.y*(s2.x - s1.x) + d1.y*(s0.x - s2.x) + d2.y*(s1.x - s0.x)) / denom;
+    const e = (d0.x*(s1.x*s2.y - s2.x*s1.y) + d1.x*(s2.x*s0.y - s0.x*s2.y) + d2.x*(s0.x*s1.y - s1.x*s0.y)) / denom;
+    const f = (d0.y*(s1.x*s2.y - s2.x*s1.y) + d1.y*(s2.x*s0.y - s0.x*s2.y) + d2.y*(s0.x*s1.y - s1.x*s0.y)) / denom;
+    return {a,b,c,d,e,f};
+  }
+
+  function imageDataToCanvas(img){
+    const c = document.createElement('canvas'); c.width = img.width; c.height = img.height;
+    c.getContext('2d').putImageData(img,0,0); return c;
+  }
+
+  // ====== MediaPipe FaceMesh ======
+  const faceMesh = new FaceMesh({locateFile: (file)=> `https://cdn.jsdelivr.net/npm/@mediapipe/face_mesh@0.4/${file}`});
+  faceMesh.setOptions({
+    maxNumFaces: 1,
+    refineLandmarks: true,
+    minDetectionConfidence: 0.7,
+    minTrackingConfidence: 0.6
+  });
+  faceMesh.onResults(onResults);
+
+  async function startCam(){
+    const stream = await navigator.mediaDevices.getUserMedia({video:{facingMode:'user', width:{ideal:1280}, height:{ideal:720}}, audio:false});
+    video.srcObject = stream; await video.play();
+    canvas.width = dbg.width = video.videoWidth; canvas.height = dbg.height = video.videoHeight;
+    new Camera(video, { onFrame: async ()=>{ await faceMesh.send({image: video}); }, width: video.videoWidth, height: video.videoHeight }).start();
+  }
+
+  function onResults(res){
+    ctx.clearRect(0,0,canvas.width,canvas.height);
+    ctx.drawImage(res.image, 0,0, canvas.width, canvas.height);
+    if(!res.multiFaceLandmarks || !res.multiFaceLandmarks.length) return;
+    const lm = res.multiFaceLandmarks[0];
+
+    // Escalar a pixeles
+    const W = canvas.width, H = canvas.height;
+    const pts = lm.map(p=> ({x: p.x*W, y: p.y*H, z: p.z}));
+
+    // Suavizado
+    const alpha = parseFloat(smoothEl.value);
+    if(!smoothedLandmarks) smoothedLandmarks = pts;
+    else smoothedLandmarks = smoothedLandmarks.map((p,i)=> ({
+      x: EMA(p.x, pts[i].x, alpha), y: EMA(p.y, pts[i].y, alpha), z: EMA(p.z, pts[i].z, alpha)
+    }));
+
+    // Construir región
+    const side = sideEl.value;
+    const ids = side==='left' ? REGION_LEFT : REGION_RIGHT;
+    const srcRegion = ids.map(i=> ({...smoothedLandmarks[i]}));
+
+    // Definir deformación: empujar comisura hacia abajo + arrastrar mejilla
+    const drop = parseFloat(intensityEl.value); // px
+    const withDeform = srcRegion.map((p,idx)=>{
+      const i = ids[idx];
+      // Puntos prioritarios: comisuras 61/291, mejilla cercana, línea mandibular
+      const isCorner = (side==='left' && i===61) || (side==='right' && i===291);
+      const isCheek = [50,101,118,280,330,349].includes(i);
+      const isJaw = [172,234,397,454].includes(i);
+      let y = p.y, x = p.x;
+      if(isCorner) { y += drop; x += (side==='left'? drop*0.15 : -drop*0.15); }
+      else if(isCheek){ y += drop*0.6; }
+      else if(isJaw){ y += drop*0.35; }
+      return {x, y};
+    });
+
+    // Recortar región, warpear y sobreescribir sobre la imagen base
+    // 1) Crear capa fuente (solo región)
+    const srcC = document.createElement('canvas'); srcC.width=W; srcC.height=H; const sctx = srcC.getContext('2d');
+    // máscara
+    sctx.save(); sctx.beginPath(); polygon(sctx, srcRegion); sctx.clip();
+    sctx.drawImage(res.image, 0,0, W,H);
+    sctx.restore();
+
+    // 2) Dibujar warpeado en destino
+    warpRegion(sctx, ctx, srcRegion, withDeform);
+
+    // Opcional: contorno
+    if(showDebug){ drawDebug(smoothedLandmarks); g.strokeStyle='rgba(248,113,113,.8)'; g.lineWidth=2; g.beginPath(); polygon(g, srcRegion); g.stroke(); }
+  }
+
+  function polygon(ctx, pts){ ctx.moveTo(pts[0].x, pts[0].y); for(let i=1;i<pts.length;i++) ctx.lineTo(pts[i].x, pts[i].y); ctx.closePath(); }
+
+  startCam().catch(err=>{ alert('No se pudo iniciar la cámara: '+err.message); });
+  </script>
+</body>
+</html>
