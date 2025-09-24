@@ -232,9 +232,7 @@
     const feather=parseFloat(featherEl.value);
     ctx.save(); if(feather>0) ctx.filter=`blur(${feather}px)`; ctx.drawImage(dstC,0,0); ctx.restore();
     ctx.save(); if(feather>0) ctx.filter=`blur(${Math.max(4,feather-6)}px)`; ctx.drawImage(dstB,0,0); ctx.restore();
-
-    // 5) Lift contralateral (muy sutil)
-    withLiftCorner(ctx);
+    // 5) (Sin lift contralateral) — evitamos artefactos visibles
 
     if(showDebug){ drawDebug(smoothedLandmarks); g.strokeStyle='rgba(248,113,113,.8)'; g.lineWidth=2; g.beginPath(); polygon(g,srcRegion); g.stroke(); }
   }
